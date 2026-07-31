@@ -1,4 +1,5 @@
 using Xunit;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Tasks;
 using LoreVcs.Types;
@@ -201,29 +202,42 @@ public class LoreFluentAPITests
         var repositoryCreateArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
         var repositoryStatusArgs = new LoreRepositoryStatusArgs { };
 
-        var logMessages = new List<string>();
+        const ulong createContext = 7000001;
+        const ulong statusContext = 7000002;
+        const ulong afterDisposeContext = 7000003;
 
-        var logMessagesAfterFirstCall = 0;
-        var logMessagesAfterSecondCall = 0;
-        var logMessagesAfterThirdCall = 0;
+        var logMessages = new ConcurrentDictionary<ulong, ConcurrentQueue<string>>();
 
         using (Lore.GlobalCallback(LoreEventTag.LOG,
-          (loreEvent, userContext) => { logMessages.Add(loreEvent.GetData<LoreLogEventDataFFI>().Message); }))
+          (loreEvent, userContext) =>
+          {
+              logMessages
+                  .GetOrAdd(userContext, _ => new ConcurrentQueue<string>())
+                  .Enqueue(loreEvent.GetData<LoreLogEventDataFFI>().Message);
+          }))
         {
-            Lore.RepositoryCreate(globalArgs, repositoryCreateArgs).Wait();
-            logMessagesAfterFirstCall = logMessages.Count;
-            Assert.True(logMessagesAfterFirstCall > 0);
+            Lore.RepositoryCreate(globalArgs, repositoryCreateArgs)
+                .UserContext(createContext)
+                .Wait();
+            Assert.True(MessageCount(logMessages, createContext) > 0);
 
-            Lore.RepositoryStatus(globalArgs, repositoryStatusArgs).Wait();
-            logMessagesAfterSecondCall = logMessages.Count;
-            Assert.True(logMessagesAfterSecondCall > logMessagesAfterFirstCall);
+            Lore.RepositoryStatus(globalArgs, repositoryStatusArgs)
+                .UserContext(statusContext)
+                .Wait();
+            Assert.True(MessageCount(logMessages, statusContext) > 0);
         }
 
         // After disposing the global callback it should no longer be executed:
-        Lore.RepositoryStatus(globalArgs, repositoryStatusArgs).Wait();
-        logMessagesAfterThirdCall = logMessages.Count;
-        Assert.Equal(logMessagesAfterThirdCall, logMessagesAfterSecondCall);
+        Lore.RepositoryStatus(globalArgs, repositoryStatusArgs)
+            .UserContext(afterDisposeContext)
+            .Wait();
+        Assert.Equal(0, MessageCount(logMessages, afterDisposeContext));
     }
+
+    private static int MessageCount(
+        ConcurrentDictionary<ulong, ConcurrentQueue<string>> messages,
+        ulong userContext
+    ) => messages.TryGetValue(userContext, out var queue) ? queue.Count : 0;
 
     [Fact]
     public async Task GlobalCallback_Async_Works()
@@ -235,30 +249,38 @@ public class LoreFluentAPITests
         var repositoryCreateArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
         var repositoryStatusArgs = new LoreRepositoryStatusArgs { };
 
-        var logMessages = new List<string>();
+        const ulong createContext = 7100001;
+        const ulong statusContext = 7100002;
+        const ulong afterDisposeContext = 7100003;
 
-        var logMessagesAfterFirstCall = 0;
-        var logMessagesAfterSecondCall = 0;
-        var logMessagesAfterThirdCall = 0;
+        var logMessages = new ConcurrentDictionary<ulong, ConcurrentQueue<string>>();
 
         var unregisterGlobalCallback = Lore.GlobalCallback(LoreEventTag.LOG,
-          (loreEvent, userContext) => { logMessages.Add(loreEvent.GetData<LoreLogEventDataFFI>().Message); }
+          (loreEvent, userContext) =>
+          {
+              logMessages
+                  .GetOrAdd(userContext, _ => new ConcurrentQueue<string>())
+                  .Enqueue(loreEvent.GetData<LoreLogEventDataFFI>().Message);
+          }
         );
 
-        await Lore.RepositoryCreate(globalArgs, repositoryCreateArgs).WaitAsync();
-        logMessagesAfterFirstCall = logMessages.Count;
-        Assert.True(logMessagesAfterFirstCall > 0);
+        await Lore.RepositoryCreate(globalArgs, repositoryCreateArgs)
+            .UserContext(createContext)
+            .WaitAsync();
+        Assert.True(MessageCount(logMessages, createContext) > 0);
 
-        await Lore.RepositoryStatus(globalArgs, repositoryStatusArgs).WaitAsync();
-        logMessagesAfterSecondCall = logMessages.Count;
-        Assert.True(logMessagesAfterSecondCall > logMessagesAfterFirstCall);
+        await Lore.RepositoryStatus(globalArgs, repositoryStatusArgs)
+            .UserContext(statusContext)
+            .WaitAsync();
+        Assert.True(MessageCount(logMessages, statusContext) > 0);
 
         unregisterGlobalCallback.Dispose();
 
         // After disposing the global callback it should no longer be executed:
-        await Lore.RepositoryStatus(globalArgs, repositoryStatusArgs).WaitAsync();
-        logMessagesAfterThirdCall = logMessages.Count;
-        Assert.Equal(logMessagesAfterThirdCall, logMessagesAfterSecondCall);
+        await Lore.RepositoryStatus(globalArgs, repositoryStatusArgs)
+            .UserContext(afterDisposeContext)
+            .WaitAsync();
+        Assert.Equal(0, MessageCount(logMessages, afterDisposeContext));
     }
 
     // --- Non-zero return code tests ---
@@ -574,24 +596,46 @@ public class LoreFluentAPITests
         var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
         var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
 
-        var logEventsA = new List<bool>();
-        var logEventsB = new List<bool>();
+        const ulong createContext = 7300001;
+
+        var logEventsA = 0;
+        var logEventsB = 0;
 
         using var unsubA = Lore.GlobalCallback(LoreEventTag.LOG,
-            (loreEvent, userContext) => { logEventsA.Add(true); });
+            (loreEvent, userContext) =>
+            {
+                if (userContext == createContext)
+                {
+                    Interlocked.Increment(ref logEventsA);
+                }
+            });
         using var unsubB = Lore.GlobalCallback(LoreEventTag.LOG,
-            (loreEvent, userContext) => { logEventsB.Add(true); });
+            (loreEvent, userContext) =>
+            {
+                if (userContext == createContext)
+                {
+                    Interlocked.Increment(ref logEventsB);
+                }
+            });
 
-        Lore.RepositoryCreate(globalArgs, repositoryArgs).Wait();
+        Lore.RepositoryCreate(globalArgs, repositoryArgs)
+            .UserContext(createContext)
+            .Wait();
 
-        // The native event forwarder may still be mid-delivery of the final event
-        // when Wait() returns (A is invoked before B for each event). The two
-        // independent counts converge once it finishes that iteration.
-        SpinWait.SpinUntil(() => logEventsA.Count == logEventsB.Count, TimeSpan.FromSeconds(2));
+        var countA = 0;
+        var countB = 0;
+        var converged = SpinWait.SpinUntil(
+            () =>
+            {
+                countA = Volatile.Read(ref logEventsA);
+                countB = Volatile.Read(ref logEventsB);
+                return countA != 0 && countA == countB;
+            },
+            TimeSpan.FromSeconds(2));
 
-        Assert.NotEmpty(logEventsA);
-        Assert.NotEmpty(logEventsB);
-        Assert.Equal(logEventsA.Count, logEventsB.Count);
+        Assert.True(converged, $"counts did not converge: A={countA}, B={countB}");
+        Assert.NotEqual(0, countA);
+        Assert.Equal(countA, countB);
     }
 
     [Fact]
@@ -603,16 +647,25 @@ public class LoreFluentAPITests
         var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
         var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
 
-        var logEvents = new List<bool>();
+        const ulong createContext = 7200001;
+
+        var logEvents = 0;
 
         using var unsub = Lore.GlobalCallback(LoreEventTag.LOG,
-            (loreEvent, userContext) => { logEvents.Add(true); });
+            (loreEvent, userContext) =>
+            {
+                if (userContext == createContext)
+                {
+                    Interlocked.Increment(ref logEvents);
+                }
+            });
 
         Lore.RepositoryCreate(globalArgs, repositoryArgs)
             .FilterByType([LoreEventTag.COMPLETE])
+            .UserContext(createContext)
             .Wait();
 
-        Assert.NotEmpty(logEvents);
+        Assert.NotEqual(0, Volatile.Read(ref logEvents));
     }
 
     [Fact]
