@@ -15,7 +15,7 @@ namespace LoreVcs.Tests;
 internal struct LoreMetadataBuilder
 {
     [FieldOffset(0)]
-    public LoreMetadataTag tag;
+    public LoreMetadataType tag;
 
     [FieldOffset(8)]
     public LoreAddress address;
@@ -149,7 +149,7 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.ADDRESS,
+            tag = LoreMetadataType.ADDRESS,
             address = new LoreAddress
             {
                 Hash = new LoreHash(TestHash),
@@ -158,7 +158,7 @@ public class LoreCustomTypesTests
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.ADDRESS, metadata.Tag);
+        Assert.Equal(LoreMetadataType.ADDRESS, metadata.Tag);
         Assert.IsType<LoreAddress>(metadata.Address);
         Assert.IsType<LoreHash>(metadata.Address.Hash);
         Assert.IsType<LoreContext>(metadata.Address.Context);
@@ -169,12 +169,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.BINARY,
+            tag = LoreMetadataType.BINARY,
             binary = new LoreBinary(TestBinary)
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.BINARY, metadata.Tag);
+        Assert.Equal(LoreMetadataType.BINARY, metadata.Tag);
         Assert.Equal(10, metadata.Binary.Length);
     }
 
@@ -183,12 +183,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.BOOLEAN,
+            tag = LoreMetadataType.BOOLEAN,
             boolean = 1
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.BOOLEAN, metadata.Tag);
+        Assert.Equal(LoreMetadataType.BOOLEAN, metadata.Tag);
         Assert.True(metadata.Boolean);
     }
 
@@ -197,12 +197,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.CONTEXT,
+            tag = LoreMetadataType.CONTEXT,
             context = new LoreContext(TestContext)
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.CONTEXT, metadata.Tag);
+        Assert.Equal(LoreMetadataType.CONTEXT, metadata.Tag);
         Assert.IsType<LoreContext>(metadata.Context);
         Assert.Equal(16, metadata.Context.Data.Length);
     }
@@ -212,12 +212,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.HASH,
+            tag = LoreMetadataType.HASH,
             hash = new LoreHash(TestHash)
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.HASH, metadata.Tag);
+        Assert.Equal(LoreMetadataType.HASH, metadata.Tag);
         Assert.IsType<LoreHash>(metadata.Hash);
         Assert.Equal(32, metadata.Hash.Data.Length);
     }
@@ -227,12 +227,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.NUMERIC,
+            tag = LoreMetadataType.NUMERIC,
             numeric = 1234
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.NUMERIC, metadata.Tag);
+        Assert.Equal(LoreMetadataType.NUMERIC, metadata.Tag);
         Assert.Equal((ulong)1234, metadata.Numeric);
     }
 
@@ -241,12 +241,12 @@ public class LoreCustomTypesTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.STRING,
+            tag = LoreMetadataType.STRING,
             @string = new LoreString("mystring")
         };
         var metadata = Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
 
-        Assert.Equal(LoreMetadataTag.STRING, metadata.Tag);
+        Assert.Equal(LoreMetadataType.STRING, metadata.Tag);
         Assert.IsType<string>(metadata.String);
         Assert.Equal("mystring", metadata.String);
     }

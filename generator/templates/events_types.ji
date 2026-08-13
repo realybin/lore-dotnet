@@ -259,7 +259,7 @@ internal unsafe struct _LoreEvent
         get => tag;
     }
 
-    {% for value in symbols.enums["lore_event_tag_t"] %}
+    {% for value, number in symbols.enums["lore_event_tag_t"] %}
         {% set type = pascal_case("lore_" + value.lower() + "_event_data") %}
         {% set name = pascal_case(value) %}
         public {{ type }}FFI {{ name}} {
@@ -365,7 +365,7 @@ public unsafe sealed class LoreEventFFI : IDisposable
     {
         VerifyPropertyAccess();
 
-        {% for value in symbols.enums["lore_event_tag_t"] %}
+        {% for value, number in symbols.enums["lore_event_tag_t"] %}
             {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
             {% set type = pascal_case(value) %}
             if (typeof(T) == typeof({{ T }}FFI) && Tag == LoreEventTag.{{ value.upper() }})
@@ -381,7 +381,7 @@ public unsafe sealed class LoreEventFFI : IDisposable
     {
         VerifyPropertyAccess();
 
-        {% for value in symbols.enums["lore_event_tag_t"] %}
+        {% for value, number in symbols.enums["lore_event_tag_t"] %}
             {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
             {% set type = pascal_case(value) %}
             if (Tag == LoreEventTag.{{ value.upper() }})

@@ -252,7 +252,7 @@ def build_augmented(visitor):
         enum_class = util.pascal_case(enum_c_type.removesuffix("_t"))
         cs_map.setdefault(enum_c_type, enum_class)
         if values:
-            init_map.setdefault(enum_class, f"{enum_class}.{values[0]}")
+            init_map.setdefault(enum_class, f"{enum_class}.{values[0][0]}")
 
     for arr in array_types:
         cs_map[arr["array_c_type"]] = arr["cs_annotation"]

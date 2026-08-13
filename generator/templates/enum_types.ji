@@ -6,27 +6,32 @@ namespace LoreVcs.Types.Enums;
 
 Creates a C# enum from the C enum
 
-For instance, for the `enum lore_branch_location_t`
+The value of each member is the one the header gives it, so an enum that is
+neither zero-based nor contiguous carries over as written.
 
-typedef enum lore_branch_location_t {
-  LORE_BRANCH_LOCATION_LOCAL = 0,
-  LORE_BRANCH_LOCATION_REMOTE = 1,
-} lore_branch_location_t;
+For instance, for the `enum lore_metadata_type_t`
+
+typedef enum lore_metadata_type_t {
+  LORE_METADATA_TYPE_ADDRESS = 1,
+  LORE_METADATA_TYPE_BOOLEAN = 2,
+  LORE_METADATA_TYPE_BINARY = 255,
+} lore_metadata_type_t;
 
 the result is:
 
-public enum LoreBranchLocation : uint
+public enum LoreMetadataType : uint
 {
-    LOCAL = 0,
-    REMOTE = 1,
+    ADDRESS = 1,
+    BOOLEAN = 2,
+    BINARY = 255,
 }
 #}
 
 {% for enum_name, enum_values in symbols.enums.items() %}
 public enum {{pascal_case(enum_name.removesuffix("_t"))}} : uint
 {
-    {% for value in enum_values %}
-        {{value}} = {{loop.index - 1}},
+    {% for value, number in enum_values %}
+        {{value}} = {{number}},
     {% endfor %}
 }
 {% endfor %}

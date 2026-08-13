@@ -28,7 +28,7 @@ public class LoreCustomTypesFromEventDataTests
     {
         var builder = new LoreMetadataBuilder
         {
-            tag = LoreMetadataTag.STRING,
+            tag = LoreMetadataType.STRING,
             @string = new LoreString("commit message")
         };
         var metadata = System.Runtime.CompilerServices.Unsafe.As<LoreMetadataBuilder, LoreMetadata>(ref builder);
@@ -41,7 +41,7 @@ public class LoreCustomTypesFromEventDataTests
 
         Assert.Equal(LoreEventTag.METADATA, eventData.Tag);
         Assert.Equal("message", eventData.Key);
-        Assert.Equal(LoreMetadataTag.STRING, eventData.Value.Tag);
+        Assert.Equal(LoreMetadataType.STRING, eventData.Value.Tag);
         Assert.IsType<string>(eventData.Value.String);
         Assert.Equal("commit message", eventData.Value.String);
     }
