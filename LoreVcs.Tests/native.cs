@@ -18,6 +18,10 @@ static class TestSetup
     {
         var logConfig = new LoreLogConfig { Level = LoreLogLevel.DEBUG };
         LoreLogConfigure(logConfig);
+
+        // lore_shutdown is terminal for the process: call it once, after every
+        // test has run, never in per-test teardown.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => LoreShutdown();
     }
 }
 
@@ -46,11 +50,14 @@ public class LoreBaseTest : IDisposable
 
     public void Dispose()
     {
-        // Tear down lorelib first so it drops cached repo handles and stops
-        // the sled flusher thread holding `level.pending`. Without this,
-        // Directory.Delete fails on Windows with UnauthorizedAccessException.
-        // Mirrors the Python SDK's teardown_method (tests/test_functions.py).
-        LoreShutdown();
+        // Release this repository's cached stores first so lorelib drops the repo
+        // handles and stops the sled flusher thread holding `level.pending`.
+        // Without this, Directory.Delete fails on Windows with
+        // UnauthorizedAccessException. Do not use LoreShutdown here: it stops the
+        // library's worker threads for the whole process, so every later test
+        // would park forever inside the native runtime.
+        using var releaseArgs = new LoreRepositoryReleaseArgs();
+        LoreRepositoryRelease(globalArgs, releaseArgs, NoOpCallback);
 
         for (int i = 0, delay = 1; i < maxRetries; ++i)
         {
