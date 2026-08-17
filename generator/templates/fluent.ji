@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Threading;
@@ -53,9 +54,13 @@ public sealed class LoreError : Exception
 /// message of every ERROR event, and the error message of a failed COMPLETE
 /// event (non-zero status). The COMPLETE message is only surfaced when no ERROR
 /// event was recorded, so an explicit error always takes precedence.
+///
+/// Recording happens on a lorelib worker thread while the calling thread reads
+/// the result, so both sides take the lock.
 /// </summary>
 internal sealed class TerminalEventRecorder
 {
+    private readonly object gate = new();
     private readonly List<string> errorMessages = new();
     private string? completeError;
 
@@ -63,14 +68,22 @@ internal sealed class TerminalEventRecorder
     {
         if (loreEvent.Tag == LoreEventTag.ERROR)
         {
-            errorMessages.Add(loreEvent.GetData<LoreErrorEventDataFFI>().ErrorInner);
+            var message = loreEvent.GetData<LoreErrorEventDataFFI>().ErrorInner;
+            lock (gate)
+            {
+                errorMessages.Add(message);
+            }
         }
         else if (loreEvent.Tag == LoreEventTag.COMPLETE)
         {
             var data = loreEvent.GetData<LoreCompleteEventDataFFI>();
             if (data.Status != 0)
             {
-                completeError = data.Error.Message;
+                var message = data.Error.Message;
+                lock (gate)
+                {
+                    completeError = message;
+                }
             }
         }
     }
@@ -79,16 +92,18 @@ internal sealed class TerminalEventRecorder
     // COMPLETE event's error message when one was recorded.
     public IReadOnlyList<string> Messages()
     {
-        if (errorMessages.Count > 0)
+        lock (gate)
         {
-            return errorMessages;
+            if (errorMessages.Count > 0)
+            {
+                return new List<string>(errorMessages);
+            }
+            if (!string.IsNullOrEmpty(completeError))
+            {
+                return new List<string> { completeError };
+            }
+            return Array.Empty<string>();
         }
-        var complete = completeError;
-        if (!string.IsNullOrEmpty(complete))
-        {
-            return new List<string> { complete };
-        }
-        return Array.Empty<string>();
     }
 }
 
@@ -100,55 +115,107 @@ public sealed class LoreExecutor<LoreArgs>
     private LoreFunctionAsync<LoreArgs> functionAsync;
     private LoreCallback callback = (LoreEventFFI loreEvent, ulong userContext) => {};
     private HashSet<LoreEventTag> filterTags = new();
+    private readonly object gate = new();
     private List<LoreEvent> collectedEvents = new();
     private Channel<LoreEvent> channel;
     private ulong userContext;
     private bool terminated;
     private TerminalEventRecorder recorder = new();
+    private Exception? callbackException;
+
+    private bool Accepts(LoreEventTag tag) => filterTags.Count == 0 || filterTags.Contains(tag);
+
+    // The event handlers run on a lorelib worker thread, which must not have a
+    // managed exception unwind through it. The first failure is kept and
+    // rethrown from the terminal method, on the calling thread.
+    private void RecordCallbackException(Exception exception)
+    {
+        Interlocked.CompareExchange(ref callbackException, exception, null);
+    }
+
+    private void ThrowIfCallbackFailed()
+    {
+        var exception = Volatile.Read(ref callbackException);
+        if (exception != null)
+        {
+            ExceptionDispatchInfo.Capture(exception).Throw();
+        }
+    }
 
     private void WaitEventHandler(LoreEventFFI loreEvent, ulong userContext)
     {
-        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
-        recorder.Record(loreEvent);
-        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
-            return;
+        try
+        {
+            Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+            recorder.Record(loreEvent);
+            if (Accepts(loreEvent.Tag))
+            {
+                callback(loreEvent, userContext);
+            }
         }
-
-        callback(loreEvent, userContext);
+        catch (Exception exception)
+        {
+            RecordCallbackException(exception);
+        }
     }
 
     private void CollectEventHandler(LoreEventFFI loreEvent, ulong userContext)
     {
-        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
-        recorder.Record(loreEvent);
-        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
-            return;
+        try
+        {
+            Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+            recorder.Record(loreEvent);
+            if (Accepts(loreEvent.Tag))
+            {
+                callback(loreEvent, userContext);
+
+                var collected = loreEvent.Clone();
+                lock (gate)
+                {
+                    collectedEvents.Add(collected);
+                }
+            }
         }
-
-        callback(loreEvent, userContext);
-
-        collectedEvents.Add(loreEvent.Clone());
+        catch (Exception exception)
+        {
+            RecordCallbackException(exception);
+        }
     }
 
     private void AsyncIterEventHandler(LoreEventFFI loreEvent, ulong userContext)
     {
-        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
-        recorder.Record(loreEvent);
-        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
-            if (loreEvent.Tag == LoreEventTag.END)
+        // Read the tag up front: the channel has to be completed on END even if
+        // the callback below throws, or the enumerator never finishes.
+        var tag = loreEvent.Tag;
+        try
+        {
+            Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+            recorder.Record(loreEvent);
+            if (Accepts(tag))
+            {
+                callback(loreEvent, userContext);
+
+                channel.Writer.TryWrite(loreEvent.Clone());
+            }
+        }
+        catch (Exception exception)
+        {
+            RecordCallbackException(exception);
+        }
+        finally
+        {
+            if (tag == LoreEventTag.END)
             {
                 channel.Writer.Complete();
             }
-            return;
         }
+    }
 
-        callback(loreEvent, userContext);
-
-        channel.Writer.TryWrite(loreEvent.Clone());
-
-        if (loreEvent.Tag == LoreEventTag.END)
+    private List<LoreEvent> SnapshotCollectedEvents()
+    {
+        lock (gate)
         {
-            channel.Writer.Complete();
+            return new List<LoreEvent>(collectedEvents);
         }
     }
 
@@ -195,6 +262,10 @@ public sealed class LoreExecutor<LoreArgs>
         return this;
     }
 
+    /// <summary>
+    /// Runs the operation and returns once lorelib has dispatched its last
+    /// event (END). Events are delivered on a lorelib worker thread.
+    /// </summary>
     public int Wait()
     {
         VerifyTermination();
@@ -202,10 +273,18 @@ public sealed class LoreExecutor<LoreArgs>
         recorder = new TerminalEventRecorder();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = WaitEventHandler };
         var returnCode = function(globalArgs, args, callback);
+        ThrowIfCallbackFailed();
         RaiseIfError(returnCode);
         return returnCode;
     }
 
+    /// <summary>
+    /// Runs the operation and completes once lorelib has dispatched its last
+    /// event (END), so no event can arrive after the await returns. A function
+    /// whose callback stays registered past COMPLETE is the exception, such as
+    /// NotificationSubscribe: it completes as soon as the subscription is
+    /// established and keeps delivering events to the callback afterwards.
+    /// </summary>
     public async Task<int> WaitAsync()
     {
         VerifyTermination();
@@ -215,6 +294,7 @@ public sealed class LoreExecutor<LoreArgs>
         // functionAsync starts the operation eagerly (so multiple WaitAsync()
         // calls run concurrently); awaiting its Task yields the return code.
         var returnCode = await functionAsync(globalArgs, args, callback).Task;
+        ThrowIfCallbackFailed();
         RaiseIfError(returnCode);
         return returnCode;
     }
@@ -226,14 +306,29 @@ public sealed class LoreExecutor<LoreArgs>
         recorder = new TerminalEventRecorder();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = AsyncIterEventHandler };
         var taskCompletionSource = functionAsync(globalArgs, args, callback);
+        // A source already faulted on return means the call never reached
+        // lorelib, so no event will ever arrive to complete the channel.
+        if (taskCompletionSource.Task.IsFaulted)
+        {
+            await taskCompletionSource.Task;
+        }
         await foreach (var ev in channel.Reader.ReadAllAsync())
         {
             yield return ev;
         }
         // The channel completed (END): surface a non-zero completion as an error.
-        RaiseIfError(await taskCompletionSource.Task);
+        var returnCode = await taskCompletionSource.Task;
+        ThrowIfCallbackFailed();
+        RaiseIfError(returnCode);
     }
 
+    /// <summary>
+    /// Runs the operation and returns every event it dispatched, including the
+    /// terminal COMPLETE and END events. Not meaningful for a function whose
+    /// callback stays registered past COMPLETE, such as NotificationSubscribe:
+    /// the events it dispatches after COMPLETE are not part of the result. Use
+    /// <see cref="AsyncIter"/> to stream those.
+    /// </summary>
     public List<LoreEvent> Collect()
     {
         VerifyTermination();
@@ -243,10 +338,16 @@ public sealed class LoreExecutor<LoreArgs>
         collectedEvents.Clear();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
         var returnCode = function(globalArgs, args, callback);
+        ThrowIfCallbackFailed();
         RaiseIfError(returnCode);
-        return collectedEvents;
+        return SnapshotCollectedEvents();
     }
 
+    /// <summary>
+    /// Runs the operation and returns every event it dispatched, including the
+    /// terminal COMPLETE and END events. See <see cref="Collect"/> for the one
+    /// kind of function this is not meaningful for.
+    /// </summary>
     public async Task<List<LoreEvent>> CollectAsync()
     {
         VerifyTermination();
@@ -256,8 +357,9 @@ public sealed class LoreExecutor<LoreArgs>
         collectedEvents.Clear();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
         var returnCode = await functionAsync(globalArgs, args, callback).Task;
+        ThrowIfCallbackFailed();
         RaiseIfError(returnCode);
-        return collectedEvents;
+        return SnapshotCollectedEvents();
     }
 }
 

@@ -706,6 +706,200 @@ public class LoreFluentAPITests
 
         Assert.Contains(collectEvents, e => e is LoreCompleteEventData);
         Assert.Contains(collectEvents, e => e is LoreEndEventData);
+
+        // waitAsync + callback
+        var waitAsyncArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = Path.Combine(tempDir, "waitAsync") };
+        var waitAsyncEvents = new ConcurrentQueue<LoreEvent>();
+        var repoUrl3 = Guid.NewGuid().ToString();
+        Lore.RepositoryCreate(waitAsyncArgs, new LoreRepositoryCreateArgs { RepositoryUrl = repoUrl3 })
+            .Callback((loreEvent, userContext) => { waitAsyncEvents.Enqueue(loreEvent.Clone()); })
+            .WaitAsync()
+            .GetAwaiter()
+            .GetResult();
+
+        Assert.Contains(waitAsyncEvents, e => e is LoreCompleteEventData);
+        Assert.Contains(waitAsyncEvents, e => e is LoreEndEventData);
+
+        // collectAsync
+        var collectAsyncArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = Path.Combine(tempDir, "collectAsync") };
+        var repoUrl4 = Guid.NewGuid().ToString();
+        var collectAsyncEvents = Lore.RepositoryCreate(collectAsyncArgs, new LoreRepositoryCreateArgs { RepositoryUrl = repoUrl4 })
+            .CollectAsync()
+            .GetAwaiter()
+            .GetResult();
+
+        Assert.Contains(collectAsyncEvents, e => e is LoreCompleteEventData);
+        Assert.Contains(collectAsyncEvents, e => e is LoreEndEventData);
+    }
+
+    // --- END-before-return tests ---
+
+    // END is the last event lorelib dispatches, and the only reliable
+    // terminator: a post-command task can still land a LOG event behind
+    // COMPLETE. The async terminals must not resume before it.
+
+    [Fact]
+    public async Task WaitAsync_Resumes_Only_After_End()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        var tags = new ConcurrentQueue<LoreEventTag>();
+        await Lore.RepositoryCreate(globalArgs, repositoryArgs)
+            .Callback((loreEvent, userContext) => { tags.Enqueue(loreEvent.Tag); })
+            .WaitAsync();
+
+        Assert.Equal(LoreEventTag.END, tags.Last());
+    }
+
+    [Fact]
+    public async Task CollectAsync_Includes_End_Event()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        var events = await Lore.RepositoryCreate(globalArgs, repositoryArgs).CollectAsync();
+
+        Assert.IsType<LoreEndEventData>(events.Last());
+    }
+
+    // The task must not be completed in a way that lets the awaiting
+    // continuation run on the lorelib worker thread that dispatched the event:
+    // that thread runs nothing but the callback, and a synchronous Lore call
+    // from it would block a thread the native runtime is driving tasks on.
+    [Fact]
+    public async Task Async_Continuation_Does_Not_Run_On_Callback_Thread()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        // Task.Run escapes xunit's synchronization context, which would
+        // otherwise post the continuation elsewhere and hide the problem.
+        await Task.Run(async () =>
+        {
+            var callbackThreadIds = new ConcurrentQueue<int>();
+            await Lore.RepositoryCreate(globalArgs, repositoryArgs)
+                .Callback((loreEvent, userContext) =>
+                {
+                    callbackThreadIds.Enqueue(Environment.CurrentManagedThreadId);
+                })
+                .WaitAsync();
+
+            Assert.DoesNotContain(Environment.CurrentManagedThreadId, callbackThreadIds);
+        });
+    }
+
+    // A synchronous Lore call is the operation that would fail outright if the
+    // continuation had resumed on a lorelib worker thread.
+    [Fact]
+    public async Task Sync_Call_After_Await_Succeeds()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        await Task.Run(async () =>
+        {
+            var createArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+            await Lore.RepositoryCreate(createArgs, new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl })
+                .WaitAsync();
+
+            var statusArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+            var result = Lore.RepositoryStatus(statusArgs, new LoreRepositoryStatusArgs()).Wait();
+
+            Assert.Equal(0, result);
+        });
+    }
+
+    // NotificationSubscribe resolves its task on COMPLETE rather than END,
+    // because a live subscription keeps the callback registered and only
+    // dispatches END on unsubscribe. Offline it fails before any subscription
+    // exists, so this covers that failure path rather than the early return;
+    // exercising a live subscription needs a notification server.
+    [Fact]
+    public async Task NotificationSubscribe_Async_Offline_Fails_Without_Hanging()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        Lore.RepositoryCreate(globalArgs, new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl }).Wait();
+
+        var subscribe = Lore.NotificationSubscribe(globalArgs, new LoreNotificationSubscribeArgs()).WaitAsync();
+        var completed = await Task.WhenAny(subscribe, Task.Delay(TimeSpan.FromSeconds(30)));
+
+        Assert.Same(subscribe, completed);
+        var error = await Assert.ThrowsAsync<LoreError>(() => subscribe);
+        Assert.NotEqual(0, error.ReturnCode);
+    }
+
+    // --- Callback exception tests ---
+
+    // An exception thrown by a user callback must not unwind into the native
+    // callback frame; it surfaces on the calling thread instead.
+
+    [Fact]
+    public void Wait_Rethrows_Callback_Exception()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => Lore.RepositoryCreate(globalArgs, repositoryArgs)
+                .Callback((loreEvent, userContext) => throw new InvalidOperationException("callback boom"))
+                .Wait()
+        );
+        Assert.Equal("callback boom", error.Message);
+    }
+
+    [Fact]
+    public async Task WaitAsync_Rethrows_Callback_Exception()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Lore.RepositoryCreate(globalArgs, repositoryArgs)
+                .Callback((loreEvent, userContext) => throw new InvalidOperationException("callback boom"))
+                .WaitAsync()
+        );
+        Assert.Equal("callback boom", error.Message);
+    }
+
+    [Fact]
+    public async Task AsyncIter_Rethrows_Callback_Exception_And_Terminates()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        var globalArgs = new LoreGlobalArgs { Offline = true, RepositoryPath = tempDir };
+        var repositoryArgs = new LoreRepositoryCreateArgs { RepositoryUrl = repositoryUrl };
+
+        // A throwing callback must still let the enumerator finish: END
+        // completes the channel regardless.
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var ev in Lore.RepositoryCreate(globalArgs, repositoryArgs)
+                .Callback((loreEvent, userContext) => throw new InvalidOperationException("callback boom"))
+                .AsyncIter())
+            {
+            }
+        });
+        Assert.Equal("callback boom", error.Message);
     }
 
     [Fact]

@@ -123,6 +123,16 @@ UNCOMMON_FUNCTIONS = [
 ]
 
 
+# Functions that leave the callback registered after COMPLETE: they keep
+# dispatching events until a long-lived subscription ends, so their END only
+# arrives then. Their asynchronous task resolves on COMPLETE instead of END,
+# matching the synchronous entry point, which lorelib returns from as soon as
+# the subscription is established.
+REGISTERED_CALLBACK_FUNCTIONS = [
+    "lore_notification_subscribe",
+]
+
+
 # Element-c-type → (wrapper_class, native_cs_type, to_native_per_element_call).
 # `to_native_per_element_call` is the C# expression used to convert one
 # element from the wrapper struct back to the native type — see types.ji.
@@ -290,6 +300,7 @@ def build_augmented(visitor):
         "hardcoded_blit_classes": hardcoded_blit_classes,
         "from_ffi_struct_types": from_ffi_struct_types,
         "uncommon_functions": UNCOMMON_FUNCTIONS,
+        "registered_callback_functions": REGISTERED_CALLBACK_FUNCTIONS,
         "array_types": array_types,
         "event_array_types": event_array_types,
     }

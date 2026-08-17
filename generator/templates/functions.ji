@@ -35,13 +35,28 @@ public static class Native
     // lorelib.dll (Windows), liblorelib.so (Linux), liblorelib.dylib (macOS).
     const string LORELIB = "lorelib";
 
-    private static ConcurrentDictionary<ulong, (ulong userContext, TaskCompletionSource<int>?)> handles = new ConcurrentDictionary<ulong, (ulong userContext, TaskCompletionSource<int>?)>();
+    // Per-call state. The status is read from COMPLETE but reported at END, the
+    // last event lorelib dispatches, so it has to outlive a single callback
+    // invocation.
+    private sealed class CallState
+    {
+        public ulong UserContext;
+        public TaskCompletionSource<int>? Completion;
+        // Set for functions whose callback stays registered past COMPLETE: END
+        // only arrives when their subscription ends, so waiting for it would
+        // keep the caller's task pending for the lifetime of the subscription.
+        public bool ResolveOnComplete;
+        public int Status;
+        public bool SawComplete;
+    }
+
+    private static ConcurrentDictionary<ulong, CallState> handles = new ConcurrentDictionary<ulong, CallState>();
 
     private unsafe static void InternalEventHandler(_LoreEvent* loreEvent, ulong handleId)
     {
         var callbackHandle = GCHandle.FromIntPtr((IntPtr)(nint)handleId);
 
-        if (!handles.TryGetValue(handleId, out var handleState) || !callbackHandle.IsAllocated)
+        if (!handles.TryGetValue(handleId, out var state) || !callbackHandle.IsAllocated)
         {
             // HandleId key does not exist in handles. Nothing to do but abort.
             Console.Error.WriteLine("Unable to resolve handle.");
@@ -57,18 +72,55 @@ public static class Native
             return;
         }
 
-        using var ev = LoreEventFFI.From(loreEvent);
-        userCallback(ev, handleState.Item1);
+        var tag = loreEvent->Tag;
 
-        if (loreEvent->Tag == LoreEventTag.COMPLETE && handleState.Item2 is not null)
+        using (var ev = LoreEventFFI.From(loreEvent))
         {
-            handleState.Item2.TrySetResult(loreEvent->Complete.Status);
+            try
+            {
+                userCallback(ev, state.UserContext);
+            }
+            catch (Exception exception)
+            {
+                // A managed exception must never unwind into the native
+                // callback frame. Consumers of the fluent API get this
+                // rethrown from the terminal method instead.
+                Console.Error.WriteLine($"Unhandled exception in Lore event callback: {exception}");
+            }
         }
 
-        if (loreEvent->Tag == LoreEventTag.END)
+        if (tag == LoreEventTag.COMPLETE)
         {
+            state.Status = loreEvent->Complete.Status;
+            state.SawComplete = true;
+            if (state.ResolveOnComplete)
+            {
+                state.Completion?.TrySetResult(state.Status);
+            }
+        }
+
+        if (tag == LoreEventTag.END)
+        {
+            var completion = state.Completion;
+            var status = state.Status;
+            var sawComplete = state.SawComplete;
+
             callbackHandle.Free();
             handles.TryRemove(handleId, out _);
+
+            if (completion is not null)
+            {
+                if (sawComplete)
+                {
+                    completion.TrySetResult(status);
+                }
+                else
+                {
+                    completion.TrySetException(new InvalidOperationException(
+                        "Lore operation ended without emitting a COMPLETE event."
+                    ));
+                }
+            }
         }
     }
 
@@ -134,7 +186,7 @@ public static class Native
                     var callbackHandle = GCHandle.Alloc(callback.Func);
                     var handleId = (ulong)(nuint)GCHandle.ToIntPtr(callbackHandle);
 
-                    if(!handles.TryAdd(handleId, (callback.UserContext, null))){
+                    if(!handles.TryAdd(handleId, new CallState { UserContext = callback.UserContext })){
                         Console.Error.WriteLine("Colliding callback handle.");
                         callbackHandle.Free();
                         return 4;
@@ -162,9 +214,20 @@ public static class Native
                 {
                     var callbackHandle = GCHandle.Alloc(callback.Func);
                     var handleId = (ulong)(nuint)GCHandle.ToIntPtr(callbackHandle);
-                    var taskCompletionSource = new TaskCompletionSource<int>();
+                    // RunContinuationsAsynchronously keeps the awaiting
+                    // continuation off the lorelib worker thread that completes
+                    // this source: that thread must run nothing but the event
+                    // callback, and blocking it in a synchronous Lore call from
+                    // the continuation would panic inside the native runtime.
+                    var taskCompletionSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-                    if(!handles.TryAdd(handleId, (callback.UserContext, taskCompletionSource))){
+                    var state = new CallState {
+                        UserContext = callback.UserContext,
+                        Completion = taskCompletionSource,
+                        ResolveOnComplete = {{ "true" if function_name.removesuffix("_async") in registered_callback_functions else "false" }},
+                    };
+
+                    if(!handles.TryAdd(handleId, state)){
                         taskCompletionSource.SetException(new InvalidOperationException("Colliding callback handle."));
                         callbackHandle.Free();
                         return taskCompletionSource;
